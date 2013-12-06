@@ -496,11 +496,15 @@ class Client(requests.Session):
         self._raise_for_status(res)
         json_ = res.json()
         s_port = str(private_port)
+        s_portt = s_port + '/tcp'
+        s_portu = s_port + '/udp'
         f_port = None
-        if s_port in json_['NetworkSettings']['PortMapping']['Udp']:
-            f_port = json_['NetworkSettings']['PortMapping']['Udp'][s_port]
-        elif s_port in json_['NetworkSettings']['PortMapping']['Tcp']:
-            f_port = json_['NetworkSettings']['PortMapping']['Tcp'][s_port]
+        if s_port in json_['NetworkSettings']['Ports']:
+            f_port = json_['NetworkSettings']['Ports'][s_port][0]['HostPort']
+        elif s_portu in json_['NetworkSettings']['Ports']:
+            f_port = json_['NetworkSettings']['Ports'][s_portu][0]['HostPort']
+        elif s_portt in json_['NetworkSettings']['Ports']:
+            f_port = json_['NetworkSettings']['Ports'][s_portt][0]['HostPort']
 
         return f_port
 
