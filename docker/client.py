@@ -592,7 +592,7 @@ class Client(requests.Session):
         elif s_portt in json_['NetworkSettings']['Ports']:
             f_port = json_['NetworkSettings']['Ports'][s_portt][0]['HostPort']
 
-        return h_ports
+        return f_port
 
     def pull(self, repository, tag=None, stream=False):
         registry, repo_name = auth.resolve_repository_name(repository)
