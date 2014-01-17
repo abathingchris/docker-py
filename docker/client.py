@@ -21,14 +21,15 @@ import requests
 import requests.exceptions
 import six
 
-import docker.auth as auth
-import docker.unixconn as unixconn
-import docker.utils as utils
+from .auth import auth
+from .unixconn import unixconn
+from .utils import utils
 
 if not six.PY3:
     import websocket
 
 DEFAULT_TIMEOUT_SECONDS = 60
+STREAM_HEADER_SIZE_BYTES = 8
 
 
 class APIError(requests.exceptions.HTTPError):
@@ -64,20 +65,23 @@ class APIError(requests.exceptions.HTTPError):
 
 
 class Client(requests.Session):
-    def __init__(self, base_url="unix://var/run/docker.sock", version="1.6",
+    def __init__(self, base_url=None, version="1.6",
                  timeout=DEFAULT_TIMEOUT_SECONDS):
         super(Client, self).__init__()
+        if base_url is None:
+            base_url = "unix://var/run/docker.sock"
         if base_url.startswith('unix:///'):
             base_url = base_url.replace('unix:/', 'unix:')
+        if base_url.startswith('tcp:'):
+            base_url = base_url.replace('tcp:', 'http:')
+        if base_url.endswith('/'):
+            base_url = base_url[:-1]
         self.base_url = base_url
         self._version = version
         self._timeout = timeout
+        self._auth_configs = auth.load_config()
 
         self.mount('unix://', unixconn.UnixAdapter(base_url, timeout))
-        try:
-            self._cfg = auth.load_config()
-        except Exception:
-            pass
 
     def _set_request_timeout(self, kwargs):
         """Prepare the kwargs for an HTTP request by inserting the timeout
@@ -104,34 +108,45 @@ class Client(requests.Session):
         except requests.exceptions.HTTPError as e:
             raise APIError(e, response, explanation=explanation)
 
-    def _stream_result(self, response):
-        self._raise_for_status(response)
-        for line in response.iter_lines(chunk_size=1):
-            # filter out keep-alive new lines
-            if line:
-                yield line + '\n'
-
-    def _stream_result_socket(self, response):
-        self._raise_for_status(response)
-        return response.raw._fp.fp._sock
-
-    def _result(self, response, json=False):
+    def _result(self, response, json=False, binary=False):
+        assert not (json and binary)
         self._raise_for_status(response)
 
         if json:
             return response.json()
+        if binary:
+            return response.content
         return response.text
 
     def _container_config(self, image, command, hostname=None, user=None,
                           detach=False, stdin_open=False, tty=False,
                           mem_limit=0, ports=None, environment=None, dns=None,
-                          volumes=None, volumes_from=None, privileged=False):
+                          volumes=None, volumes_from=None,
+                          network_disabled=False):
         if isinstance(command, six.string_types):
             command = shlex.split(str(command))
         if isinstance(environment, dict):
             environment = [
                 '{0}={1}'.format(k, v) for k, v in environment.items()
             ]
+
+        if ports and isinstance(ports, list):
+            exposed_ports = {}
+            for port_definition in ports:
+                port = port_definition
+                proto = 'tcp'
+                if isinstance(port_definition, tuple):
+                    if len(port_definition) == 2:
+                        proto = port_definition[1]
+                    port = port_definition[0]
+                exposed_ports['{0}/{1}'.format(port, proto)] = {}
+            ports = exposed_ports
+
+        if volumes and isinstance(volumes, list):
+            volumes_dict = {}
+            for vol in volumes:
+                volumes_dict[vol] = {}
+            volumes = volumes_dict
 
         attach_stdin = False
         attach_stdout = False
@@ -160,7 +175,7 @@ class Client(requests.Session):
             'Image':        image,
             'Volumes':      volumes,
             'VolumesFrom':  volumes_from,
-            'Privileged':   privileged,
+            'NetworkDisabled': network_disabled
         }
 
     def _post_json(self, url, data, **kwargs):
@@ -198,31 +213,95 @@ class Client(requests.Session):
     def _create_websocket_connection(self, url):
         return websocket.create_connection(url)
 
+    def _stream_result(self, response):
+        """Generator for straight-out, non chunked-encoded HTTP responses."""
+        self._raise_for_status(response)
+        for line in response.iter_lines(chunk_size=1):
+            # filter out keep-alive new lines
+            if line:
+                yield line + '\n'
+
+    def _stream_result_socket(self, response):
+        self._raise_for_status(response)
+        return response.raw._fp.fp._sock
+
     def _stream_helper(self, response):
+        """Generator for data coming from a chunked-encoded HTTP response."""
+        socket_fp = self._stream_result_socket(response)
+        socket_fp.setblocking(1)
+        socket = socket_fp.makefile()
+        while True:
+            size = int(socket.readline(), 16)
+            if size <= 0:
+                break
+            data = socket.readline()
+            if not data:
+                break
+            yield data
+
+    def _multiplexed_buffer_helper(self, response):
+        """A generator of multiplexed data blocks read from a buffered
+        response."""
+        buf = self._result(response, binary=True)
+        walker = 0
+        while True:
+            if len(buf[walker:]) < 8:
+                break
+            _, length = struct.unpack_from('>BxxxL', buf[walker:])
+            start = walker + STREAM_HEADER_SIZE_BYTES
+            end = start + length
+            walker = end
+            yield str(buf[start:end])
+
+    def _multiplexed_socket_stream_helper(self, response):
+        """A generator of multiplexed data blocks coming from a response
+        socket."""
         socket = self._stream_result_socket(response)
-        while True:
-            chunk = socket.recv(4096)
-            if chunk:
-                parts = chunk.strip().split('\r\n')
-                for i in range(len(parts)):
-                    if i % 2 != 0:
-                        yield parts[i] + '\n'
-                    else:
-                        size = int(parts[i], 16)
-                if size <= 0:
-                    break
-            else:
-                break
 
-    def attach(self, container):
-        socket = self.attach_socket(container)
+        def recvall(socket, size):
+            data = ''
+            while size > 0:
+                block = socket.recv(size)
+                if not block:
+                    return None
+
+                data += block
+                size -= len(block)
+            return data
 
         while True:
-            chunk = socket.recv(4096)
-            if chunk:
-                yield chunk
-            else:
+            socket.settimeout(None)
+            header = recvall(socket, STREAM_HEADER_SIZE_BYTES)
+            if not header:
                 break
+            _, length = struct.unpack('>BxxxL', header)
+            if not length:
+                break
+            data = recvall(socket, length)
+            if not data:
+                break
+            yield data
+
+    def attach(self, container, stdout=True, stderr=True,
+               stream=False, logs=False):
+        if isinstance(container, dict):
+            container = container.get('Id')
+        params = {
+            'logs': logs and 1 or 0,
+            'stdout': stdout and 1 or 0,
+            'stderr': stderr and 1 or 0,
+            'stream': stream and 1 or 0,
+        }
+        u = self._url("/containers/{0}/attach".format(container))
+        response = self._post(u, params=params, stream=stream)
+
+        # Stream multi-plexing was introduced in API v1.6.
+        if utils.compare_version('1.6', self._version) < 0:
+            return stream and self._stream_result(response) or \
+                self._result(response, binary=True)
+
+        return stream and self._multiplexed_socket_stream_helper(response) or \
+            ''.join([x for x in self._multiplexed_buffer_helper(response)])
 
     def attach_socket(self, container, params=None, ws=False):
         if params is None:
@@ -241,7 +320,7 @@ class Client(requests.Session):
             u, None, params=self._attach_params(params), stream=True))
 
     def build(self, path=None, tag=None, quiet=False, fileobj=None,
-              nocache=False, rm=False, stream=False):
+              nocache=False, rm=False, stream=False, timeout=None):
         remote = context = headers = None
         if path is None and fileobj is None:
             raise Exception("Either path or fileobj needs to be provided.")
@@ -265,7 +344,12 @@ class Client(requests.Session):
             headers = {'Content-Type': 'application/tar'}
 
         response = self._post(
-            u, data=context, params=params, headers=headers, stream=stream
+            u,
+            data=context,
+            params=params,
+            headers=headers,
+            stream=stream,
+            timeout=timeout,
         )
 
         if context is not None:
@@ -321,12 +405,12 @@ class Client(requests.Session):
     def create_container(self, image, command=None, hostname=None, user=None,
                          detach=False, stdin_open=False, tty=False,
                          mem_limit=0, ports=None, environment=None, dns=None,
-                         volumes=None, volumes_from=None, privileged=False,
-                         name=None):
+                         volumes=None, volumes_from=None,
+                         network_disabled=False, name=None):
 
         config = self._container_config(
             image, command, hostname, user, detach, stdin_open, tty, mem_limit,
-            ports, environment, dns, volumes, volumes_from, privileged
+            ports, environment, dns, volumes, volumes_from, network_disabled
         )
         return self.create_container_from_config(config, name)
 
@@ -388,27 +472,34 @@ class Client(requests.Session):
             return [x['Id'] for x in res]
         return res
 
-    def import_image(self, src, data=None, repository=None, tag=None):
+    def import_image(self, src=None, repository=None, tag=None, image=None):
         u = self._url("/images/create")
         params = {
             'repo': repository,
             'tag': tag
         }
-        try:
-            # XXX: this is ways not optimal but the only way
-            # for now to import tarballs through the API
-            fic = open(src)
-            data = fic.read()
-            fic.close()
-            src = "-"
-        except IOError:
-            # file does not exists or not a file (URL)
-            data = None
-        if isinstance(src, six.string_types):
-            params['fromSrc'] = src
-            return self._result(self._post(u, data=data, params=params))
 
-        return self._result(self._post(u, data=src, params=params))
+        if src:
+            try:
+                # XXX: this is ways not optimal but the only way
+                # for now to import tarballs through the API
+                fic = open(src)
+                data = fic.read()
+                fic.close()
+                src = "-"
+            except IOError:
+                # file does not exists or not a file (URL)
+                data = None
+            if isinstance(src, six.string_types):
+                params['fromSrc'] = src
+                return self._result(self._post(u, data=data, params=params))
+            return self._result(self._post(u, data=src, params=params))
+
+        if image:
+            params['fromImage'] = image
+            return self._result(self._post(u, data=None, params=params))
+
+        raise Exception("Must specify a src or image")
 
     def info(self):
         return self._result(self._get(self._url("/info")),
@@ -446,48 +537,42 @@ class Client(requests.Session):
 
         self._raise_for_status(res)
 
-    def login(self, username, password=None, email=None, registry=None):
-        url = self._url("/auth")
-        if registry is None:
-            registry = auth.INDEX_URL
-        if getattr(self, '_cfg', None) is None:
-            self._cfg = auth.load_config()
-        authcfg = auth.resolve_authconfig(self._cfg, registry)
-        if 'username' in authcfg and authcfg['username'] == username:
+    def login(self, username, password=None, email=None, registry=None,
+              reauth=False):
+        # If we don't have any auth data so far, try reloading the config file
+        # one more time in case anything showed up in there.
+        if not self._auth_configs:
+            self._auth_configs = auth.load_config()
+
+        registry = registry or auth.INDEX_URL
+
+        authcfg = auth.resolve_authconfig(self._auth_configs, registry)
+        # If we found an existing auth config for this registry and username
+        # combination, we can return it immediately unless reauth is requested.
+        if authcfg and authcfg.get('username', None) == username \
+                and not reauth:
             return authcfg
+
         req_data = {
             'username': username,
             'password': password,
-            'email': email
+            'email': email,
+            'serveraddress': registry,
         }
-        res = self._result(self._post_json(url, data=req_data), True)
-        if res['Status'] == 'Login Succeeded':
-            self._cfg['Configs'][registry] = req_data
-        return res
 
-    def logs(self, container):
-        if isinstance(container, dict):
-            container = container.get('Id')
-        params = {
-            'logs': 1,
-            'stdout': 1,
-            'stderr': 1
-        }
-        u = self._url("/containers/{0}/attach".format(container))
-        if utils.compare_version('1.6', self._version) < 0:
-            return self._result(self._post(u, params=params))
-        res = ''
-        response = self._result(self._post(u, params=params))
-        walker = 0
-        while walker < len(response):
-            header = response[walker:walker+8]
-            walker += 8
-            # we don't care about the type of stream since we want both
-            # stdout and stderr
-            length = struct.unpack(">L", header[4:].encode())[0]
-            res += response[walker:walker+length]
-            walker += length
-        return res
+        response = self._post_json(self._url('/auth'), data=req_data)
+        if response.status_code == 200:
+            self._auth_configs[registry] = req_data
+        return self._result(response, json=True)
+
+    def logs(self, container, stdout=True, stderr=True, stream=False):
+        return self.attach(
+            container,
+            stdout=stdout,
+            stderr=stderr,
+            stream=stream,
+            logs=True
+        )
 
     def port(self, container, private_port):
         if isinstance(container, dict):
@@ -496,6 +581,7 @@ class Client(requests.Session):
         self._raise_for_status(res)
         json_ = res.json()
         s_port = str(private_port)
+        
         s_portt = s_port + '/tcp'
         s_portu = s_port + '/udp'
         f_port = None
@@ -506,7 +592,7 @@ class Client(requests.Session):
         elif s_portt in json_['NetworkSettings']['Ports']:
             f_port = json_['NetworkSettings']['Ports'][s_portt][0]['HostPort']
 
-        return f_port
+        return h_ports
 
     def pull(self, repository, tag=None, stream=False):
         registry, repo_name = auth.resolve_repository_name(repository)
@@ -520,16 +606,20 @@ class Client(requests.Session):
         headers = {}
 
         if utils.compare_version('1.5', self._version) >= 0:
-            if getattr(self, '_cfg', None) is None:
-                self._cfg = auth.load_config()
-            authcfg = auth.resolve_authconfig(self._cfg, registry)
-            # do not fail if no atuhentication exists
-            # for this specific registry as we can have a readonly pull
+            # If we don't have any auth data so far, try reloading the config
+            # file one more time in case anything showed up in there.
+            if not self._auth_configs:
+                self._auth_configs = auth.load_config()
+            authcfg = auth.resolve_authconfig(self._auth_configs, registry)
+
+            # Do not fail here if no atuhentication exists for this specific
+            # registry as we can have a readonly pull. Just put the header if
+            # we can.
             if authcfg:
                 headers['X-Registry-Auth'] = auth.encode_header(authcfg)
-        u = self._url("/images/create")
-        response = self._post(u, params=params, headers=headers, stream=stream,
-                              timeout=None)
+
+        response = self._post(self._url('/images/create'), params=params,
+                              headers=headers, stream=stream, timeout=None)
 
         if stream:
             return self._stream_helper(response)
@@ -540,26 +630,26 @@ class Client(requests.Session):
         registry, repo_name = auth.resolve_repository_name(repository)
         u = self._url("/images/{0}/push".format(repository))
         headers = {}
-        if getattr(self, '_cfg', None) is None:
-            self._cfg = auth.load_config()
-        authcfg = auth.resolve_authconfig(self._cfg, registry)
+
         if utils.compare_version('1.5', self._version) >= 0:
-            # do not fail if no atuhentication exists
-            # for this specific registry as we can have an anon push
+            # If we don't have any auth data so far, try reloading the config
+            # file one more time in case anything showed up in there.
+            if not self._auth_configs:
+                self._auth_configs = auth.load_config()
+            authcfg = auth.resolve_authconfig(self._auth_configs, registry)
+
+            # Do not fail here if no atuhentication exists for this specific
+            # registry as we can have a readonly pull. Just put the header if
+            # we can.
             if authcfg:
                 headers['X-Registry-Auth'] = auth.encode_header(authcfg)
 
-            if stream:
-                return self._stream_helper(
-                    self._post_json(u, None, headers=headers, stream=True))
-            else:
-                return self._result(
-                    self._post_json(u, None, headers=headers, stream=False))
-        if stream:
-            return self._stream_helper(
-                self._post_json(u, authcfg, stream=True))
+            response = self._post_json(u, None, headers=headers, stream=stream)
         else:
-            return self._result(self._post_json(u, authcfg, stream=False))
+            response = self._post_json(u, authcfg, stream=stream)
+
+        return stream and self._stream_helper(response) \
+            or self._result(response)
 
     def remove_container(self, container, v=False, link=False):
         if isinstance(container, dict):
@@ -587,7 +677,7 @@ class Client(requests.Session):
                             True)
 
     def start(self, container, binds=None, port_bindings=None, lxc_conf=None,
-              publish_all_ports=False, links=None):
+              publish_all_ports=False, links=None, privileged=False):
         if isinstance(container, dict):
             container = container.get('Id')
 
@@ -607,7 +697,9 @@ class Client(requests.Session):
             start_config['Binds'] = bind_pairs
 
         if port_bindings:
-            start_config['PortBindings'] = port_bindings
+            start_config['PortBindings'] = utils.convert_port_bindings(
+                port_bindings
+            )
 
         start_config['PublishAllPorts'] = publish_all_ports
 
@@ -617,6 +709,8 @@ class Client(requests.Session):
             ]
 
             start_config['Links'] = formatted_links
+
+        start_config['Privileged'] = privileged
 
         url = self._url("/containers/{0}/start".format(container))
         res = self._post_json(url, data=start_config)

@@ -162,17 +162,6 @@ class TestCreateContainerWithBinds(BaseTestCase):
         self.assertIn(filename, logs)
 
 
-class TestCreateContainerPrivileged(BaseTestCase):
-    def runTest(self):
-        res = self.client.create_container('busybox', 'true', privileged=True)
-        inspect = self.client.inspect_container(res['Id'])
-        self.assertIn('Config', inspect)
-        # Since Nov 2013, the Privileged flag is no longer part of the
-        # container's config exposed via the API (safety concerns?).
-        #
-        # self.assertEqual(inspect['Config']['Privileged'], True)
-
-
 class TestCreateContainerWithName(BaseTestCase):
     def runTest(self):
         res = self.client.create_container('busybox', 'true', name='foobar')
@@ -219,6 +208,28 @@ class TestStartContainerWithDictInsteadOfId(BaseTestCase):
             self.assertEqual(inspect['State']['ExitCode'], 0)
 
 
+class TestStartContainerPrivileged(BaseTestCase):
+    def runTest(self):
+        res = self.client.create_container('busybox', 'true')
+        self.assertIn('Id', res)
+        self.tmp_containers.append(res['Id'])
+        self.client.start(res['Id'], privileged=True)
+        inspect = self.client.inspect_container(res['Id'])
+        self.assertIn('Config', inspect)
+        self.assertIn('ID', inspect)
+        self.assertTrue(inspect['ID'].startswith(res['Id']))
+        self.assertIn('Image', inspect)
+        self.assertIn('State', inspect)
+        self.assertIn('Running', inspect['State'])
+        if not inspect['State']['Running']:
+            self.assertIn('ExitCode', inspect['State'])
+            self.assertEqual(inspect['State']['ExitCode'], 0)
+        # Since Nov 2013, the Privileged flag is no longer part of the
+        # container's config exposed via the API (safety concerns?).
+        #
+        # self.assertEqual(inspect['Config']['Privileged'], True)
+
+
 class TestWait(BaseTestCase):
     def runTest(self):
         res = self.client.create_container('busybox', ['sleep', '10'])
@@ -261,6 +272,25 @@ class TestLogs(BaseTestCase):
         exitcode = self.client.wait(id)
         self.assertEqual(exitcode, 0)
         logs = self.client.logs(id)
+        self.assertEqual(logs, snippet + '\n')
+
+
+class TestLogsStreaming(BaseTestCase):
+    def runTest(self):
+        snippet = 'Flowering Nights (Sakuya Iyazoi)'
+        container = self.client.create_container(
+            'busybox', 'echo {0}'.format(snippet)
+        )
+        id = container['Id']
+        self.client.start(id)
+        self.tmp_containers.append(id)
+        logs = ''
+        for chunk in self.client.logs(id, stream=True):
+            logs += chunk
+
+        exitcode = self.client.wait(id)
+        self.assertEqual(exitcode, 0)
+
         self.assertEqual(logs, snippet + '\n')
 
 
@@ -390,6 +420,34 @@ class TestKillWithSignal(BaseTestCase):
         self.assertNotEqual(state['ExitCode'], 0)
         self.assertIn('Running', state)
         self.assertEqual(state['Running'], False, state)
+
+
+class TestPort(BaseTestCase):
+    def runTest(self):
+
+        port_bindings = {
+            1111: ('127.0.0.1', '4567'),
+            2222: ('192.168.0.100', '4568')
+        }
+
+        container = self.client.create_container(
+            'busybox', ['sleep', '60'], ports=port_bindings.keys()
+            )
+        id = container['Id']
+
+        self.client.start(container, port_bindings=port_bindings)
+
+        #Call the port function on each biding and compare expected vs actual
+        for port in port_bindings:
+            actual_bindings = self.client.port(container, port)
+            port_binding = actual_bindings.pop()
+
+            ip, host_port = port_binding['HostIp'], port_binding['HostPort']
+
+            self.assertEqual(ip, port_bindings[port][0])
+            self.assertEqual(host_port, port_bindings[port][1])
+
+        self.client.kill(id)
 
 
 class TestRestart(BaseTestCase):
@@ -745,11 +803,29 @@ class TestLoadConfig(BaseTestCase):
         f.write('email = sakuya@scarlet.net')
         f.close()
         cfg = docker.auth.load_config(folder)
-        self.assertNotEqual(cfg['Configs'][docker.auth.INDEX_URL], None)
-        cfg = cfg['Configs'][docker.auth.INDEX_URL]
-        self.assertEqual(cfg['Username'], b'sakuya')
-        self.assertEqual(cfg['Password'], b'izayoi')
-        self.assertEqual(cfg['Email'], 'sakuya@scarlet.net')
+        self.assertNotEqual(cfg[docker.auth.INDEX_URL], None)
+        cfg = cfg[docker.auth.INDEX_URL]
+        self.assertEqual(cfg['username'], b'sakuya')
+        self.assertEqual(cfg['password'], b'izayoi')
+        self.assertEqual(cfg['email'], 'sakuya@scarlet.net')
+        self.assertEqual(cfg.get('Auth'), None)
+
+
+class TestLoadJSONConfig(BaseTestCase):
+    def runTest(self):
+        folder = tempfile.mkdtemp()
+        f = open(os.path.join(folder, '.dockercfg'), 'w')
+        auth_ = base64.b64encode(b'sakuya:izayoi').decode('ascii')
+        email_ = 'sakuya@scarlet.net'
+        f.write('{{"{}": {{"auth": "{}", "email": "{}"}}}}\n'.format(
+            docker.auth.INDEX_URL, auth_, email_))
+        f.close()
+        cfg = docker.auth.load_config(folder)
+        self.assertNotEqual(cfg[docker.auth.INDEX_URL], None)
+        cfg = cfg[docker.auth.INDEX_URL]
+        self.assertEqual(cfg['username'], b'sakuya')
+        self.assertEqual(cfg['password'], b'izayoi')
+        self.assertEqual(cfg['email'], 'sakuya@scarlet.net')
         self.assertEqual(cfg.get('Auth'), None)
 
 
